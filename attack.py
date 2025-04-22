@@ -4,7 +4,7 @@ import torch
 import evaluate
 from transformers import DonutProcessor, VisionEncoderDecoderConfig
 
-#omri branch
+#omri branch test
 
 from utils.models import ModelWrapper
 from utils.data import TextDataset, DonutDataset
