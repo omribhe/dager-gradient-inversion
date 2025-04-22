@@ -16,6 +16,7 @@ def remove_padding(tokenizer, ids, left=False):
                 break
     return tokenizer.decode(ids)
 
+
 def grad_dist(grads1, grads2, args):
     ret = 0.0
     n_g = 0

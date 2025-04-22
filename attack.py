@@ -1,9 +1,11 @@
 import datetime
 import numpy as np
 import torch
-from datasets import load_metric
+import evaluate
+from transformers import DonutProcessor, VisionEncoderDecoderConfig
+
 from utils.models import ModelWrapper
-from utils.data import TextDataset
+from utils.data import TextDataset, DonutDataset
 from utils.filtering_encoder import filter_encoder
 from utils.filtering_decoder import filter_decoder
 from utils.functional import get_top_B_in_span, check_if_in_span, remove_padding, filter_outliers, get_span_dists
@@ -32,7 +34,7 @@ def filter_l1(args, model_wrapper, R_Qs):
     while True:
         print(f'L1 Position {p}')
         embeds = model_wrapper.get_embeddings(p)
-        if model_wrapper.is_bert():
+        if model_wrapper.is_bert(): # or model_wrapper.is_donut():
             if args.defense_noise is None:
                 _, res_ids_new, res_types_new = get_top_B_in_span(R_Qs[0], embeds, args.batch_size, args.l1_span_thresh, args.dist_norm)
             else:
@@ -72,12 +74,17 @@ def reconstruct(args, device, sample, metric, model_wrapper: ModelWrapper):
     global total_correct_tokens, total_tokens, total_correct_maxB_tokens
 
     tokenizer = model_wrapper.tokenizer
-    
-    sequences, true_labels = sample
-    
-    orig_batch = tokenizer(sequences,padding=True, truncation=True, max_length=min(tokenizer.model_max_length, model_wrapper.emb_size - 20),return_tensors='pt').to(args.device)
-    
-    true_grads = model_wrapper.compute_grads(orig_batch, true_labels)
+    if args.dataset == 'donut':
+        pixel_values, orig_batch, true_labels, attention_mask = sample
+        # Create attention mask
+        orig_batch = {"pixel_values": pixel_values.unsqueeze(0),"input_ids": orig_batch.unsqueeze(0), 'attention_mask': attention_mask.unsqueeze(0)}
+    else:
+        sequences, true_labels = sample
+        orig_batch = tokenizer(sequences,padding=True, truncation=True, max_length=min(tokenizer.model_max_length, model_wrapper.emb_size - 20),return_tensors='pt').to(args.device)
+    if args.dataset == 'donut':
+        true_grads, encoder_hidden_state = model_wrapper.compute_grads(batch = {"pixel_values": pixel_values.unsqueeze(0),"decoder_input_ids": orig_batch['input_ids']}, y_labels=true_labels.unsqueeze(0))
+    else:
+        true_grads = model_wrapper.compute_grads(orig_batch.to(args.device), true_labels.to(args.device))
     if args.defense_noise is not None:
         for grad in true_grads:
             grad.data = grad.data + torch.randn(grad.shape) * args.defense_noise
@@ -174,7 +181,10 @@ def reconstruct(args, device, sample, metric, model_wrapper: ModelWrapper):
                 input_layer1 = model_wrapper.get_layer_inputs(orig_sentence, token_type_ids)[0]
             else:
                 attention_mask = orig_batch['attention_mask'][s][:orig_sentence.shape[1]].reshape(1,-1)
-                input_layer1 = model_wrapper.get_layer_inputs(orig_sentence, attention_mask=attention_mask)[0]
+                if args.dataset == 'donut':
+                    input_layer1 = model_wrapper.get_layer_inputs(orig_sentence, attention_mask=attention_mask, encoder_last_hidden_state=encoder_hidden_state)[0]
+                else:
+                    input_layer1 = model_wrapper.get_layer_inputs(orig_sentence, attention_mask=attention_mask)[0]
 
             sizesq2 = check_if_in_span(R_Q2, input_layer1, args.dist_norm)
             boolsq2 = sizesq2 < args.l2_span_thresh
@@ -201,7 +211,11 @@ def reconstruct(args, device, sample, metric, model_wrapper: ModelWrapper):
             for i in range(len(res_ids)):
                 if len(res_ids[i]) > args.max_ids:
                     max_ids = args.max_ids
-            predicted_sentences, predicted_sentences_scores, top_B_incorrect_sentences, top_B_incorrect_scores  = filter_decoder(args, model_wrapper, R_Qs, res_ids, max_ids=max_ids)
+            if args.dataset == 'donut':
+                encoder_last_hidden_state = encoder_hidden_state
+            else:
+                encoder_last_hidden_state = None
+            predicted_sentences, predicted_sentences_scores, top_B_incorrect_sentences, top_B_incorrect_scores  = filter_decoder(args, model_wrapper, R_Qs, res_ids, max_ids=max_ids, encoder_last_hidden_state=encoder_last_hidden_state)
             if len(predicted_sentences) < orig_batch['input_ids'].shape[0]:
                 predicted_sentences += top_B_incorrect_sentences
                 predicted_sentences_scores += top_B_incorrect_scores
@@ -291,7 +305,8 @@ def reconstruct(args, device, sample, metric, model_wrapper: ModelWrapper):
         cost = np.zeros((len(prediction), len(prediction)))
         for i in range(len(prediction)):
             for j in range(len(prediction)):
-                fm = metric.compute(predictions=[prediction[i]], references=[reference[j]])['rouge1'].mid.fmeasure
+                # fm = metric.compute(predictions=[prediction[i]], references=[reference[j]])['rouge1'].mid.fmeasure
+                fm = metric.compute(predictions=[prediction[i]], references=[reference[j]])['rouge1']
                 cost[i, j] = 1.0 - fm
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -322,10 +337,24 @@ def print_metrics(args, res, suffix):
 
 def main():
     device = torch.device(args.device)
-    metric = load_metric('rouge', cache_dir=args.cache_dir)
-    dataset = TextDataset(args.device, args.dataset, args.split, args.n_inputs, args.batch_size, args.cache_dir)
-
+    metric = evaluate.load('rouge')
     model_wrapper = ModelWrapper(args)
+
+    if args.dataset == 'donut':
+
+        dataset = DonutDataset(
+            dataset_name_or_path='nielsr/docvqa_1200_examples_donut',
+            max_length=128,
+            split='train',
+            task_start_token='<s_docvqa>',
+            prompt_end_token='<s_answer>',
+            sort_json_key=False,  # cord dataset is preprocessed, so no need for this
+            image_size=[1280, 960],
+            processor=model_wrapper.get_processor(),
+            model=model_wrapper.get_model(),
+        )
+    else:
+        dataset = TextDataset(args.device, args.dataset, args.split, args.n_inputs, args.batch_size, args.cache_dir)
 
     print('\n\nAttacking..\n', flush=True)
     predictions, references = [], []
@@ -365,11 +394,11 @@ def main():
 
         print('[Curr input metrics]:', flush=True)
         res = metric.compute(predictions=prediction, references=reference)
-        print_metrics(args, res, suffix='curr')
+        # print_metrics(args, res, suffix='curr')
 
         print('[Aggregate metrics]:', flush=True)
         res = metric.compute(predictions=predictions, references=references)
-        print_metrics(args, res, suffix='agg')
+        # print_metrics(args, res, suffix='agg')
 
         input_time = str(datetime.timedelta(seconds=time.time() - t_input_start)).split(".")[0]
         total_time = str(datetime.timedelta(seconds=time.time() - t_start)).split(".")[0]

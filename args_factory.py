@@ -11,7 +11,7 @@ def get_args(argv=None):
     
     # Method and setting
     parser.add_argument('--rng_seed', type=int, default=101) 
-    parser.add_argument('--dataset', choices=['cola', 'sst2', 'rte', 'rotten_tomatoes', 'stanfordnlp/imdb', 'glnmario/ECHR'], required=True)
+    parser.add_argument('--dataset', choices=['cola', 'sst2', 'rte', 'rotten_tomatoes', 'stanfordnlp/imdb', 'glnmario/ECHR', 'donut'], required=True)
     parser.add_argument('--task', choices=['seq_class', 'next_token_pred'], required=True)
     parser.add_argument('--pad', choices=['right', 'left'], default='right')
     parser.add_argument('--split', choices=['val', 'test'], required=True)

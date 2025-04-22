@@ -3,16 +3,17 @@ import torch
 import peft
 import numpy as np
 from utils.ext import update_causal_mask
-from utils.partial_models import add_partial_forward_gpt2, add_partial_forward_bert, add_partial_forward_llama
+from utils.partial_models import add_partial_forward_gpt2, add_partial_forward_bert, add_partial_forward_llama, \
+    add_partial_forward_donut_decoder
 from constants import config
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
 from utils.functional import get_layer_decomp
 
 class ModelWrapper():
     def __init__(self, args):
-        assert (args.model_path in ['bert-base-uncased', 'gpt2', 'openai-community/gpt2-large', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B']),\
+        assert (args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa','bert-base-uncased', 'gpt2', 'openai-community/gpt2-large', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B']),\
             'Model is not yet supported - add it to assertion list and specify implementation details'
-        access_token = os.environ['HF_TOKEN']
+        # access_token = os.environ['HF_TOKEN']
         self.args = args
         model_kwargs = {'cache_dir': args.cache_dir} if args.cache_dir is not None else {}
 
@@ -31,15 +32,30 @@ class ModelWrapper():
         if args.precision == 'double':
             model_kwargs['torch_dtype'] = torch.float64
         if args.task == 'seq_class':
-            self.model = AutoModelForSequenceClassification.from_pretrained(**model_kwargs)
+            self.model = AutoModelForSequenceClassification.from_pretrained(**model_kwargs).to(self.args.device)
         elif args.task == 'next_token_pred':
-            self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
+            if args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']:
+                from transformers import DonutProcessor, VisionEncoderDecoderModel, VisionEncoderDecoderConfig
+
+                config_donut = VisionEncoderDecoderConfig.from_pretrained(args.model_path)
+                config_donut.encoder.image_size = [1280, 960]
+                config_donut.decoder.max_length = 128
+                self.processor = DonutProcessor.from_pretrained(args.model_path)
+                self.processor.feature_extractor.size = [960, 1280]
+                self.processor.feature_extractor.do_align_long_axis = False
+                self.model = VisionEncoderDecoderModel.from_pretrained(args.model_path, config=config_donut).to(self.args.device)
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(**model_kwargs).to(self.args.device)
         else:
             assert False
         g_cpu = torch.Generator(device=self.model.device)
         g_cpu.manual_seed(0)
         self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, token=access_token, cache_dir = args.cache_dir)
+        if args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']:
+            self.tokenizer = self.processor.tokenizer
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, cache_dir = args.cache_dir)
+        # self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True, token=access_token, cache_dir = args.cache_dir)
         self.tokenizer.model_max_length = 512
         
         if args.pad == 'left':
@@ -61,7 +77,30 @@ class ModelWrapper():
             
             self.emb_size = self.model.config.n_embd
             add_partial_forward_gpt2(self.model.transformer)
+        elif args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']:
+            self.start_token = self.tokenizer.convert_tokens_to_ids("<s_docvqa>")
+            self.eos_token = self.tokenizer.eos_token_id
+            self.pad_token = self.tokenizer.pad_token_id
 
+            self.model.config.pad_token_id = self.pad_token
+            self.model.config.decoder_start_token_id = self.start_token
+
+            self.layer_ids =  list(range(359,462,26))
+            # self.layer_ids = list(range(369,462,26))
+            # self.layer_ids = [359,369,385,395,411,421,437,447]
+
+            donut_token_embeddings = self.model.decoder.model.decoder.embed_tokens.weight
+            donut_position_embeddings = self.model.decoder.model.decoder.embed_positions.weight
+
+            pos_first_row = donut_position_embeddings[0].unsqueeze(0)  # (1, 1024)
+            embeddings_no_pos = donut_token_embeddings + pos_first_row  # broadcast
+
+            # Suppose you want shape [1, vocab_size, 1, 1024]:
+            self.embeddings_weight_nopos = embeddings_no_pos[None, :, None, :]
+
+            self.emb_size = self.model.config.decoder.d_model  # Not applicable; not based on token input size
+            # add_partial
+            add_partial_forward_donut_decoder(self.model)
         elif args.model_path in ['bert-base-uncased']:
           
             self.start_token = 101
@@ -144,19 +183,35 @@ class ModelWrapper():
             param.data = og_weights[i]
         self.model.eval()
         return grad
-            
+
+    def move_to_device(self,batch, device):
+        if isinstance(batch, torch.Tensor):
+            return batch.to(device)
+        elif isinstance(batch, (tuple, list)):
+            return type(batch)(self.move_to_device(x, device) for x in batch)
+        elif isinstance(batch, dict):
+            return {k: self.move_to_device(v, device) for k, v in batch.items()}
+        else:
+            return batch  # leave untouched if not tensor-like
+
     def compute_grads(self, batch, y_labels, create_graph=False):
+        outs = []
         if self.args.grad_mode == 'eval':
             self.model.eval()
         else:
             self.model.train()
         dev = y_labels.device
         if self.args.precision != '8bit':
-            batch = batch.to(self.args.device_grad)
+            batch = self.move_to_device(batch,self.args.device_grad)
             y_labels = y_labels.to(self.args.device_grad)
             self.model.to(self.args.device_grad)
         if self.args.task == 'next_token_pred':
-            labels = torch.where(batch['attention_mask'].bool(), batch['input_ids'], -100)
+            if self.args.dataset == 'donut':
+                labels = y_labels
+                # Store pixel values in the wrapper
+                self.set_last_pixel_values(batch['pixel_values'])
+            else:
+                labels = torch.where(batch['attention_mask'].bool(), batch['input_ids'], -100)
         elif self.args.task == 'seq_class':
             labels = y_labels
         if self.args.grad_b is None:
@@ -172,7 +227,9 @@ class ModelWrapper():
                 grad = torch.autograd.grad(loss, self.trainable_parameters(), create_graph=create_graph, allow_unused=True)
                 
             else:
-                
+                self.model = self.model.to(self.args.device)
+                batch = self.move_to_device(batch,self.args.device)
+                labels = labels.to(self.args.device)
                 outs = self.model(**batch, labels=labels, output_hidden_states=True)
                     
                 if self.args.loss == 'mse':
@@ -197,12 +254,15 @@ class ModelWrapper():
             grad = tuple([param.grad.detach().cpu()/self.args.grad_b for param in self.model.parameters()])
         self.set_model_device(dev)
         if self.args.precision != '8bit':
-            batch = batch.to(dev)
+            batch = self.move_to_device(batch,self.args.device_grad)
             y_labels = y_labels.to(dev)
         self.model.eval()
         #torch.save(grad, f'./grad_{self.args.algo}1.pt')
         #raise ValueError
-        return grad
+        if self.args.dataset == 'donut':
+            return grad, outs.encoder_hidden_states[-1]
+        else:
+            return grad
             
     def set_model_device(self, device):
         if self.args.precision == '8bit':
@@ -237,7 +297,7 @@ class ModelWrapper():
         
         for i in range(self.args.n_layers):
             grad_Q = true_grads[self.layer_ids[i]]
-            if self.args.model_path in ['gpt2', 'openai-community/gpt2-large']:
+            if self.args.model_path in ['gpt2', 'openai-community/gpt2-large']: # ,"naver-clova-ix/donut-base-finetuned-docvqa"]:
                 grad_Q = grad_Q.T
             _, R_Q = get_layer_decomp(grad_Q, B=B, tol=tol, upcast=(self.args.precision=='half'))
             R_Q = R_Q.to(self.args.device)
@@ -245,6 +305,7 @@ class ModelWrapper():
         return B, R_Qs
             
     def get_embeddings(self, pos = None):
+        self.model = self.model.to(self.args.device)
         if self.args.model_path in ['bert-base-uncased']:
             bert_embeddings_weight_position = self.model.bert.embeddings.position_embeddings.weight.unsqueeze(0)
             emb = self.embeddings_weight_nopos.to(self.args.device) + bert_embeddings_weight_position[0][pos:pos+1,None,None,:]
@@ -259,8 +320,29 @@ class ModelWrapper():
         elif self.args.model_path in ['meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B']:
             emb = self.embeddings_weight_nopos.to(self.args.device)
             return self.model.model.layers[0].input_layernorm(emb)
-        
-    def get_layer_inputs(self, sentences, token_type_ids=None, attention_mask=None, layers=1):
+        elif self.args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']:
+            # Get token embeddings and positional embeddings from the decoder.
+            donut_token_embeddings = self.model.decoder.model.decoder.embed_tokens.weight  # shape: (vocab_size, hidden_dim)
+            donut_pos_embeddings = self.model.decoder.model.decoder.embed_positions.weight  # shape: (max_positions, hidden_dim)
+
+            # Assume that self.embeddings_weight_nopos is a tensor of shape (vocab_size, hidden_dim)
+            # Here we add the positional embedding for the given position.
+            # [pos:pos+1] extracts a slice with shape (1, hidden_dim) so that broadcasting works correctly.
+            emb = donut_token_embeddings.to(self.args.device) + donut_pos_embeddings[pos:pos + 1].to(self.args.device)
+
+            # If the decoder applies a layer norm on its embeddings (often named layernorm_embedding),
+            # you can mimic that by applying it here.
+            if hasattr(self.model.decoder.model.decoder, 'layernorm_embedding'):
+                emb = self.model.decoder.model.decoder.layernorm_embedding(emb.to(self.args.device))
+            # Otherwise, you might also try the alternative layer norm (e.g., layer_norm)
+            elif hasattr(self.model.decoder.model.decoder, 'layer_norm'):
+                emb = self.model.decoder.model.decoder.layer_norm(emb.to(self.args.device))
+
+            return emb.unsqueeze(0)
+
+
+
+    def get_layer_inputs(self, sentences, token_type_ids=None, attention_mask=None, layers=1, encoder_last_hidden_state=None):
         if self.args.model_path in ['bert-base-uncased']:
             # if token_type_ids is None:
             #     raise ValueError('Token type must be defined when model is BERT')
@@ -288,12 +370,71 @@ class ModelWrapper():
             #     layer_inputs.append(self.model.model.layers[i+1].input_layernorm(emb))
             # return layer_inputs
             return self.model.model.get_hidden_states(input_ids=sentences, position_ids=position_ids,attention_mask=attention_mask, n_layers=layers)
-        
+        elif self.args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']:
+            # self.model.decoder.get_hidden_states(input_ids=sentences, encoder_hidden_states=encoder_last_hidden_state, attention_mask=attention_mask, n_layers=layers)
+            encoder_last_hidden_state = encoder_last_hidden_state.to(self.args.device) if encoder_last_hidden_state is not None else None
+            sentences = sentences.to(self.args.device)
+            attention_mask = attention_mask.to(self.args.device) if attention_mask is not None else None
+            # return self.model.decoder(input_ids=sentences, encoder_hidden_states=encoder_last_hidden_state, attention_mask=attention_mask).hidden_states
+            return self.model.decoder(input_ids=sentences, encoder_hidden_states=encoder_last_hidden_state,output_hidden_states=True).hidden_states
+
+        elif self.args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa1']:
+            decoder_input_ids = sentences.to(self.args.device)
+            decoder_input_ids = decoder_input_ids.unsqueeze(0) if decoder_input_ids.dim() == 1 else decoder_input_ids
+            if decoder_input_ids.shape[0] > 1:
+                decoder_input_ids = decoder_input_ids.transpose(0, 1)
+
+            pixel_values = self.last_pixel_values.to(self.args.device)
+
+            # 1. Encoder forward pass
+            encoder_outputs = self.model.encoder(pixel_values=pixel_values)
+            encoder_hidden_states = encoder_outputs.last_hidden_state
+
+
+            # 2. Decoder embeddings
+            token_embeds = self.model.decoder.get_input_embeddings()(decoder_input_ids)
+            pos_embeds = self.model.decoder.model.decoder.embed_positions(decoder_input_ids)
+            hidden_states = token_embeds + pos_embeds
+
+            # Apply layer normalization if present
+            if hasattr(self.model.decoder.model.decoder, 'layernorm_embedding'):
+                hidden_states = self.model.decoder.model.decoder.layernorm_embedding(hidden_states)
+
+            layer_inputs = []
+
+            print("decoder_input_ids.shape:", decoder_input_ids.shape)
+            print("pixel_values.shape:", pixel_values.shape)
+            print("token_embeds.shape:", token_embeds.shape)
+            print("pos_embeds.shape:", pos_embeds.shape)
+            print("hidden_states.shape (init):", hidden_states.shape)
+            print("encoder_hidden_states.shape:", encoder_hidden_states.shape)
+
+            # 3. Forward through each decoder layer with the causal mask
+            for i in range(layers):
+
+                if encoder_hidden_states.size(0) != hidden_states.size(0):
+                    encoder_hidden_states = encoder_hidden_states.expand(hidden_states.size(0), -1, -1)
+
+                print(f"[{i}] hidden_states:", hidden_states.shape)
+
+                decoder_layer = self.model.decoder.model.decoder.layers[i]
+                hidden_states, *_ = decoder_layer(
+                    hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=None,
+                    past_key_value=None,
+                    use_cache=False,
+                    output_attentions=False
+                )
+                layer_inputs.append(hidden_states.clone())
+
+            return layer_inputs
+
     def is_bert(self):
         return self.args.model_path in ['bert-base-uncased']
     
     def is_decoder(self):
-        return self.args.model_path in ['gpt2', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf','openai-community/gpt2-large', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B']
+        return self.args.model_path in ['gpt2', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf','openai-community/gpt2-large', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B',"naver-clova-ix/donut-base-finetuned-docvqa"]
         
     def has_rope(self):
         return self.args.model_path in ['meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-2-70b-hf', 'meta-llama/Meta-Llama-3-8B', 'meta-llama/Meta-Llama-3.1-8B', 'meta-llama/Meta-Llama-3-70B']
@@ -302,4 +443,18 @@ class ModelWrapper():
         return self.start_token is not None
     def is_lower(self):
         return self.args.precision in ['8bit', 'half']
+
+    def get_processor(self):
+        return self.processor
+
+    def get_model(self):
+        return self.model
+
+    def is_donut(self):
+        return self.args.model_path in ['naver-clova-ix/donut-base-finetuned-docvqa']
+
+    def set_last_pixel_values(self, pixel_values):
+        self.last_pixel_values = pixel_values.to(self.args.device)
+
+
 

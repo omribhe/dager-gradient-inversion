@@ -5,7 +5,7 @@ from utils.functional import check_if_in_span, get_span_dists, filter_outliers
 import itertools
 from tqdm import tqdm
 import numpy as np
-def filter_decoder(args, model_wrapper, R_Qs, res_ids, max_ids=-1):
+def filter_decoder(args, model_wrapper, R_Qs, res_ids, max_ids=-1,encoder_last_hidden_state=None):
     R_Q2 = R_Qs[1]
     res_ids = copy.deepcopy(res_ids)
     for i in range(len(res_ids)):
@@ -20,8 +20,8 @@ def filter_decoder(args, model_wrapper, R_Qs, res_ids, max_ids=-1):
         batch = torch.tensor(start_ids).unsqueeze(1)
         
     is_batch_incorrect = torch.zeros_like(batch).squeeze(1)
-    
-    scores = check_if_in_span(R_Q2, model_wrapper.get_layer_inputs(batch.to(args.device))[0], args.dist_norm).mean(dim=1).to('cpu')
+
+    scores = check_if_in_span(R_Q2, model_wrapper.get_layer_inputs(batch.to(args.device), encoder_last_hidden_state=encoder_last_hidden_state)[0], args.dist_norm).mean(dim=1).to('cpu')
 
     predicted_sentences = []
     predicted_sentences_scores = []

@@ -466,3 +466,58 @@ def add_partial_forward_llama(model:LlamaModel) -> None:
         return all_hidden_states[1:]
         
     model.get_hidden_states = types.MethodType(get_hidden_states, model)
+
+
+
+def add_partial_forward_donut_decoder(donut_model):
+    decoder = donut_model.decoder  # this is usually BART decoder
+
+    def get_hidden_states(
+        self,
+        input_ids: torch.LongTensor,
+        encoder_hidden_states: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+        n_layers: Optional[int] = 2,
+    ) -> List[torch.FloatTensor]:
+
+        inputs_embeds = self.embed_tokens(input_ids) * self.embed_scale
+        positions = self.embed_positions(input_ids)
+        hidden_states = inputs_embeds + positions
+        hidden_states = self.layernorm_embedding(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+
+        all_hidden_states = []
+
+        next_past_key_values = [] if use_cache else None
+
+        for idx, decoder_layer in enumerate(self.layers):
+            all_hidden_states.append(hidden_states)
+
+            if idx >= n_layers:
+                break
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                past_key_value=past_key_values[idx] if past_key_values is not None else None,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_past_key_values.append(layer_outputs[1 if output_attentions else 1])
+
+        all_hidden_states.append(self.final_layer_norm(hidden_states))
+
+        return all_hidden_states[1:]
+
+    # Attach method to the decoder
+    decoder.get_hidden_states = types.MethodType(get_hidden_states, decoder)
